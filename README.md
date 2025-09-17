@@ -7,17 +7,16 @@
 2. Export credentials: `SB_MGMT_TOKEN`, `SOURCE_SPACE_ID`, `TARGET_SPACE_ID`.
 3. Optional: set `SBX_OUT_DIR` to change the local schema directory (default `component-schemas/`).
 
-## CLI Overview
-```
-sbx [command] [flags]
-  --token        Storyblok management token (SB_MGMT_TOKEN)
-  --source-space Source space ID (SOURCE_SPACE_ID)
-  --target-space Target space ID (TARGET_SPACE_ID)
-  --out          Schema output directory (SBX_OUT_DIR or component-schemas/)
-```
+## Global Flags
+- `--token string` Storyblok management token (defaults to `SB_MGMT_TOKEN`).
+- `--source-space int` Default source space ID (`SOURCE_SPACE_ID`).
+- `--target-space int` Default target space ID (`TARGET_SPACE_ID`).
+- `--out string` Local schema directory (`SBX_OUT_DIR`, falls back to `component-schemas/`).
+- `-h, --help` Print command help.
 
-## Usage Examples
+## Commands & Usage
 ### Pull component schemas
+Key flags: `--space` (override source space), `--match` (`exact|prefix|glob`), `--all`, `--dry-run`.
 ```
 # Pull named components from the source space
 sbx pull-components hero teaser
@@ -30,6 +29,7 @@ sbx pull-components hero --dry-run
 ```
 
 ### Push component schemas
+Key flags: `--space` (override target space), `--dir` (schema directory), `--match` (`exact|prefix|glob`), `--all`, `--dry-run`.
 ```
 # Push everything under component-schemas/ to the target space
 sbx push-components --all
@@ -42,6 +42,7 @@ sbx push-components hero --dry-run
 ```
 
 ### Generate shell completion
+Accepts `bash`, `zsh`, `fish`, or `powershell` as the shell argument.
 ```
 sbx completion zsh > "${fpath[1]}/_sbx"
 ```
