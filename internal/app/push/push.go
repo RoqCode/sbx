@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -31,14 +32,15 @@ type Options struct {
 
 // Result summarises the outcome of the push operation.
 type Result struct {
-	ExitCode          int
-	ComponentsSynced  int
-	PresetsSynced     int
-	Duration          time.Duration
-	RateLimitRetries  int64
-	MissingSelectors  []string
-	CreatedComponents []string
-	UpdatedComponents []string
+	ExitCode           int
+	ComponentsSynced   int
+	PresetsSynced      int
+	Duration           time.Duration
+	RateLimitRetries   int64
+	ServerErrorRetries int64
+	MissingSelectors   []string
+	CreatedComponents  []string
+	UpdatedComponents  []string
 }
 
 var (
@@ -52,6 +54,188 @@ var (
 	colorReset   = "\033[0m"
 	useColor     = enableColor()
 )
+
+type groupCache struct {
+	mu   sync.RWMutex
+	data map[string]string
+}
+
+func newGroupCache() *groupCache {
+	return &groupCache{data: make(map[string]string)}
+}
+
+func (c *groupCache) Set(name, uuid string) {
+	if name == "" || uuid == "" {
+		return
+	}
+	key := strings.ToLower(strings.TrimSpace(name))
+	c.mu.Lock()
+	c.data[key] = uuid
+	c.mu.Unlock()
+}
+
+func (c *groupCache) Lookup(name string) (string, bool) {
+	key := strings.ToLower(strings.TrimSpace(name))
+	c.mu.RLock()
+	value, ok := c.data[key]
+	c.mu.RUnlock()
+	return value, ok
+}
+
+func (c *groupCache) Has(name string) bool {
+	_, ok := c.Lookup(name)
+	return ok
+}
+
+type tagCache struct {
+	mu   sync.RWMutex
+	data map[string]int
+}
+
+func newTagCache() *tagCache {
+	return &tagCache{data: make(map[string]int)}
+}
+
+func (c *tagCache) Set(name string, id int) {
+	if name == "" || id <= 0 {
+		return
+	}
+	c.mu.Lock()
+	c.data[name] = id
+	c.mu.Unlock()
+}
+
+func (c *tagCache) Get(name string) (int, bool) {
+	c.mu.RLock()
+	id, ok := c.data[name]
+	c.mu.RUnlock()
+	return id, ok
+}
+
+func (c *tagCache) Has(name string) bool {
+	_, ok := c.Get(name)
+	return ok
+}
+
+type componentCache struct {
+	mu   sync.RWMutex
+	data map[string]storyblok.Component
+}
+
+func newComponentCache() *componentCache {
+	return &componentCache{data: make(map[string]storyblok.Component)}
+}
+
+func (c *componentCache) Set(name string, component storyblok.Component) {
+	key := strings.ToLower(strings.TrimSpace(name))
+	if key == "" {
+		return
+	}
+	c.mu.Lock()
+	c.data[key] = component
+	c.mu.Unlock()
+}
+
+type componentPlan struct {
+	index     int
+	component storyblok.Component
+	existing  storyblok.Component
+	exists    bool
+	presets   []storyblok.ComponentPreset
+}
+
+type componentOutcome struct {
+	index       int
+	name        string
+	componentID int
+	presets     int
+	created     bool
+	updated     bool
+}
+
+type componentProcessor struct {
+	client        *storyblok.Client
+	spaceID       int
+	groups        *groupCache
+	tags          *tagCache
+	components    *componentCache
+	targetPresets []storyblok.ComponentPreset
+}
+
+func (p *componentProcessor) Process(ctx context.Context, plan componentPlan) (componentOutcome, error) {
+	component := plan.component
+	if plan.component.ComponentGroupName != "" {
+		uuid, err := ensureComponentGroup(ctx, p.client, p.spaceID, p.groups, plan.component.ComponentGroupName)
+		if err != nil {
+			return componentOutcome{}, err
+		}
+		component.ComponentGroupUUID = uuid
+		component.ComponentGroupName = ""
+	}
+
+	if err := mapSchemaGroupWhitelist(&component, p.groups.Lookup); err != nil {
+		return componentOutcome{}, err
+	}
+
+	tagIDs, err := ensureInternalTags(ctx, p.client, p.spaceID, p.tags, component.InternalTagsList)
+	if err != nil {
+		return componentOutcome{}, err
+	}
+	component.InternalTagIDs = storyblok.IntSlice(tagIDs)
+
+	outcome := componentOutcome{
+		index:   plan.index,
+		name:    component.Name,
+		presets: len(plan.presets),
+	}
+
+	if plan.exists {
+		updatedComp, err := updateComponent(ctx, p.client, p.spaceID, plan.existing, component, plan.presets, p.targetPresets)
+		if err != nil {
+			return outcome, err
+		}
+		outcome.updated = true
+		outcome.name = updatedComp.Name
+		outcome.componentID = updatedComp.ID
+		if !strings.EqualFold(plan.existing.Name, updatedComp.Name) {
+			p.components.Replace(plan.existing.Name, updatedComp.Name, updatedComp)
+		} else {
+			p.components.Set(updatedComp.Name, updatedComp)
+		}
+	} else {
+		createdComp, err := createComponent(ctx, p.client, p.spaceID, component, plan.presets)
+		if err != nil {
+			return outcome, err
+		}
+		outcome.created = true
+		outcome.name = createdComp.Name
+		outcome.componentID = createdComp.ID
+		p.components.Set(createdComp.Name, createdComp)
+	}
+
+	return outcome, nil
+}
+
+func (c *componentCache) Get(name string) (storyblok.Component, bool) {
+	key := strings.ToLower(strings.TrimSpace(name))
+	c.mu.RLock()
+	component, ok := c.data[key]
+	c.mu.RUnlock()
+	return component, ok
+}
+
+func (c *componentCache) Replace(oldName, newName string, component storyblok.Component) {
+	oldKey := strings.ToLower(strings.TrimSpace(oldName))
+	newKey := strings.ToLower(strings.TrimSpace(newName))
+	c.mu.Lock()
+	if oldKey != "" {
+		delete(c.data, oldKey)
+	}
+	if newKey != "" {
+		c.data[newKey] = component
+	}
+	c.mu.Unlock()
+}
 
 // Run executes the push workflow.
 func Run(ctx context.Context, opts Options) (Result, error) {
@@ -164,79 +348,130 @@ func Run(ctx context.Context, opts Options) (Result, error) {
 	}
 	infof("Target space has %d components, %d groups, %d presets, %d tags", len(targetComponents), len(targetGroups), len(targetPresets), len(targetTags))
 
-	groupUUIDByName := make(map[string]string, len(targetGroups))
+	groupCache := newGroupCache()
 	for _, g := range targetGroups {
-		if g.Name != "" {
-			groupUUIDByName[strings.ToLower(g.Name)] = g.UUID
+		if g.Name != "" && g.UUID != "" {
+			groupCache.Set(g.Name, g.UUID)
 		}
 	}
 
-	targetByName := make(map[string]storyblok.Component, len(targetComponents))
+	componentCache := newComponentCache()
 	for _, comp := range targetComponents {
-		targetByName[strings.ToLower(comp.Name)] = comp
+		componentCache.Set(comp.Name, comp)
 	}
 
-	tagIDByName := make(map[string]int, len(targetTags))
+	tagCache := newTagCache()
 	for _, tag := range targetTags {
-		tagIDByName[tag.Name] = tag.ID
+		if tag.Name != "" && tag.ID > 0 {
+			tagCache.Set(tag.Name, tag.ID)
+		}
 	}
 
-	var created, updated []string
+	var plans []componentPlan
+	plans = make([]componentPlan, 0, len(selectedComponents))
 
 	for i, plan := range selectedComponents {
 		component := plan.Component
 		infof("[%d/%d] syncing component %s", i+1, len(selectedComponents), component.Name)
 
-		if plan.Component.ComponentGroupName != "" {
-			uuid, err := ensureComponentGroup(ctx, client, opts.SpaceID, groupUUIDByName, plan.Component.ComponentGroupName)
-			if err != nil {
-				result.ExitCode = 2
-				return result, err
-			}
-			component.ComponentGroupUUID = uuid
-			component.ComponentGroupName = ""
-		}
-
-		if err := mapSchemaGroupWhitelist(&component, groupUUIDByName); err != nil {
-			result.ExitCode = 2
-			return result, err
-		}
-
-		tagIDs, err := ensureInternalTags(ctx, client, opts.SpaceID, tagIDByName, component.InternalTagsList)
-		if err != nil {
-			result.ExitCode = 2
-			return result, err
-		}
-		component.InternalTagIDs = storyblok.IntSlice(tagIDs)
-
-		existing, exists := targetByName[strings.ToLower(component.Name)]
+		existing, exists := componentCache.Get(component.Name)
 		componentPresets := presetsForComponent(component, presetMap)
 		infof("Component %s has %d preset candidates", component.Name, len(componentPresets))
 
 		if opts.DryRun {
-			logDryRun(component, exists, opts.SpaceID, len(componentPresets))
+			logDryRun(component, exists, opts.SpaceID, len(componentPresets), groupCache.Has, tagCache.Has)
 			result.ComponentsSynced++
 			result.PresetsSynced += len(componentPresets)
 			continue
 		}
 
-		if exists {
-			successf("Updating component %s (id=%d)", component.Name, existing.ID)
-			if err := updateComponent(ctx, client, opts.SpaceID, existing, component, componentPresets, targetPresets); err != nil {
-				result.ExitCode = 2
-				return result, err
-			}
-			updated = append(updated, component.Name)
-		} else {
-			successf("Creating component %s", component.Name)
-			if err := createComponent(ctx, client, opts.SpaceID, component, componentPresets, &created, targetByName); err != nil {
-				result.ExitCode = 2
-				return result, err
-			}
+		idx := len(plans)
+		plans = append(plans, componentPlan{
+			index:     idx,
+			component: component,
+			existing:  existing,
+			exists:    exists,
+			presets:   componentPresets,
+		})
+	}
+
+	var created, updated []string
+
+	if !opts.DryRun && len(plans) > 0 {
+		processor := componentProcessor{
+			client:        client,
+			spaceID:       opts.SpaceID,
+			groups:        groupCache,
+			tags:          tagCache,
+			components:    componentCache,
+			targetPresets: targetPresets,
 		}
 
-		result.ComponentsSynced++
-		result.PresetsSynced += len(componentPresets)
+		workerCount := 4
+		if len(plans) < workerCount {
+			workerCount = len(plans)
+		}
+		if workerCount < 1 {
+			workerCount = 1
+		}
+
+		jobs := make(chan componentPlan)
+		outcomes := make([]componentOutcome, len(plans))
+		var outcomeMu sync.Mutex
+		egWorkers, egCtx := errgroup.WithContext(ctx)
+
+		for i := 0; i < workerCount; i++ {
+			egWorkers.Go(func() error {
+				for {
+					select {
+					case <-egCtx.Done():
+						return egCtx.Err()
+					case job, ok := <-jobs:
+						if !ok {
+							return nil
+						}
+						outcome, err := processor.Process(egCtx, job)
+						if err != nil {
+							return err
+						}
+						outcomeMu.Lock()
+						outcomes[job.index] = outcome
+						outcomeMu.Unlock()
+					}
+				}
+			})
+		}
+
+		go func() {
+			defer close(jobs)
+			for _, job := range plans {
+				select {
+				case <-egCtx.Done():
+					return
+				case jobs <- job:
+				}
+			}
+		}()
+
+		if err := egWorkers.Wait(); err != nil {
+			result.ExitCode = 2
+			return result, err
+		}
+
+		for _, outcome := range outcomes {
+			if outcome.name == "" {
+				continue
+			}
+			if outcome.created {
+				successf("Created component %s (id=%d)", outcome.name, outcome.componentID)
+				created = append(created, outcome.name)
+			} else if outcome.updated {
+				successf("Updated component %s (id=%d)", outcome.name, outcome.componentID)
+				updated = append(updated, outcome.name)
+			}
+			result.ComponentsSynced++
+			result.PresetsSynced += outcome.presets
+		}
 	}
 
 	sort.Strings(created)
@@ -245,6 +480,7 @@ func Run(ctx context.Context, opts Options) (Result, error) {
 	result.CreatedComponents = created
 	result.UpdatedComponents = updated
 	result.RateLimitRetries = counters.Status429.Load()
+	result.ServerErrorRetries = counters.Status5xx.Load()
 	result.Duration = time.Since(start)
 
 	printPushSummary(result, opts)
@@ -298,6 +534,8 @@ func discoverComponentFiles(opts Options) ([]string, error) {
 func discoverPresetFiles(opts Options) ([]PresetFile, error) {
 	dirs := candidateDirs(opts.Dir, "presets")
 	var presets []PresetFile
+	var parseErrors []string
+	var missingFields []string
 	for _, dir := range dirs {
 		entries, err := os.ReadDir(dir)
 		if err != nil {
@@ -317,33 +555,47 @@ func discoverPresetFiles(opts Options) ([]PresetFile, error) {
 			path := filepath.Join(dir, name)
 			var preset storyblok.ComponentPreset
 			if err := fsutil.ReadJSON(path, &preset); err != nil {
-				warnf("Skipping invalid preset file %s: %v", path, err)
+				parseErrors = append(parseErrors, fmt.Sprintf("%s (%v)", filepath.Base(path), err))
 				continue
 			}
 			if preset.Name == "" || preset.Preset == nil {
-				warnf("Skipping preset file %s without name or preset content", path)
+				missingFields = append(missingFields, filepath.Base(path))
 				continue
 			}
 			presets = append(presets, PresetFile{Path: path, Preset: preset})
 		}
 	}
 	sort.Slice(presets, func(i, j int) bool { return presets[i].Path < presets[j].Path })
+	if len(parseErrors) > 0 {
+		warnf("Skipped %d preset files with parse errors: %s", len(parseErrors), summarizeList(parseErrors, 3))
+	}
+	if len(missingFields) > 0 {
+		warnf("Skipped %d preset files missing name/preset: %s", len(missingFields), summarizeList(missingFields, 3))
+	}
 	return presets, nil
 }
 
 func loadComponents(files []string) ([]ComponentFile, error) {
 	components := make([]ComponentFile, 0, len(files))
+	var parseErrors []string
+	var missingFields []string
 	for _, path := range files {
 		var comp storyblok.Component
 		if err := fsutil.ReadJSON(path, &comp); err != nil {
-			warnf("Skipping invalid component file %s: %v", path, err)
+			parseErrors = append(parseErrors, fmt.Sprintf("%s (%v)", filepath.Base(path), err))
 			continue
 		}
 		if comp.Name == "" || comp.Schema == nil {
-			warnf("Skipping component file %s without name or schema", path)
+			missingFields = append(missingFields, filepath.Base(path))
 			continue
 		}
 		components = append(components, ComponentFile{Path: path, Component: comp})
+	}
+	if len(parseErrors) > 0 {
+		warnf("Skipped %d component files with parse errors: %s", len(parseErrors), summarizeList(parseErrors, 3))
+	}
+	if len(missingFields) > 0 {
+		warnf("Skipped %d component files missing name/schema: %s", len(missingFields), summarizeList(missingFields, 3))
 	}
 	return components, nil
 }
@@ -404,20 +656,40 @@ func presetsForComponent(component storyblok.Component, presetMap map[string][]s
 	return presetMap[name]
 }
 
-func ensureComponentGroup(ctx context.Context, client *storyblok.Client, spaceID int, groups map[string]string, groupName string) (string, error) {
-	key := strings.ToLower(groupName)
-	if uuid, ok := groups[key]; ok {
+func ensureComponentGroup(ctx context.Context, client *storyblok.Client, spaceID int, groups *groupCache, groupName string) (string, error) {
+	if groupName == "" {
+		return "", nil
+	}
+	if uuid, ok := groups.Lookup(groupName); ok {
 		return uuid, nil
 	}
+
+	key := strings.ToLower(strings.TrimSpace(groupName))
+
+	groups.mu.Lock()
+	if uuid, ok := groups.data[key]; ok {
+		groups.mu.Unlock()
+		return uuid, nil
+	}
+	groups.mu.Unlock()
+
 	created, err := client.CreateComponentGroup(ctx, spaceID, storyblok.ComponentGroup{Name: groupName})
 	if err != nil {
 		return "", err
 	}
-	groups[key] = created.UUID
+
+	groups.mu.Lock()
+	if uuid, ok := groups.data[key]; ok {
+		groups.mu.Unlock()
+		return uuid, nil
+	}
+	groups.data[key] = created.UUID
+	groups.mu.Unlock()
+
 	return created.UUID, nil
 }
 
-func mapSchemaGroupWhitelist(component *storyblok.Component, groups map[string]string) error {
+func mapSchemaGroupWhitelist(component *storyblok.Component, lookup func(string) (string, bool)) error {
 	if component.Schema == nil {
 		return nil
 	}
@@ -436,8 +708,7 @@ func mapSchemaGroupWhitelist(component *storyblok.Component, groups map[string]s
 			if value == "" {
 				continue
 			}
-			key := strings.ToLower(value)
-			if uuid, ok := groups[key]; ok {
+			if uuid, ok := lookup(value); ok {
 				mapped = append(mapped, uuid)
 			} else {
 				mapped = append(mapped, value)
@@ -448,49 +719,70 @@ func mapSchemaGroupWhitelist(component *storyblok.Component, groups map[string]s
 	return nil
 }
 
-func ensureInternalTags(ctx context.Context, client *storyblok.Client, spaceID int, tags map[string]int, source []storyblok.InternalTag) ([]int, error) {
+func ensureInternalTags(ctx context.Context, client *storyblok.Client, spaceID int, tags *tagCache, source []storyblok.InternalTag) ([]int, error) {
 	if len(source) == 0 {
 		return nil, nil
 	}
 	var ids []int
 	for _, tag := range source {
-		if tag.Name == "" {
+		name := strings.TrimSpace(tag.Name)
+		if name == "" {
 			continue
 		}
-		if id, ok := tags[tag.Name]; ok {
+		if id, ok := tags.Get(name); ok {
 			ids = append(ids, id)
 			continue
 		}
-		created, err := client.CreateInternalTag(ctx, spaceID, storyblok.InternalTag{Name: tag.Name, ObjectType: "component"})
+		created, err := client.CreateInternalTag(ctx, spaceID, storyblok.InternalTag{Name: name, ObjectType: "component"})
 		if err != nil {
 			return nil, err
 		}
-		tags[tag.Name] = created.ID
+		tags.Set(name, created.ID)
 		ids = append(ids, created.ID)
 	}
 	return ids, nil
 }
 
-func logDryRun(component storyblok.Component, exists bool, spaceID int, presetCount int) {
+func logDryRun(component storyblok.Component, exists bool, spaceID int, presetCount int, hasGroup func(string) bool, hasTag func(string) bool) {
 	action := "create"
 	if exists {
 		action = "update"
 	}
 	fmt.Printf("Dry run: %s component %s in space %d (%d presets)\n", action, component.Name, spaceID, presetCount)
+
+	if component.ComponentGroupName != "" {
+		if !hasGroup(component.ComponentGroupName) {
+			fmt.Printf("  - would create component group %q\n", component.ComponentGroupName)
+		}
+	}
+
+	if len(component.InternalTagsList) > 0 {
+		missing := make([]string, 0, len(component.InternalTagsList))
+		for _, tag := range component.InternalTagsList {
+			name := strings.TrimSpace(tag.Name)
+			if name == "" {
+				continue
+			}
+			if !hasTag(name) {
+				missing = append(missing, name)
+			}
+		}
+		if len(missing) > 0 {
+			fmt.Printf("  - would create internal tags: %s\n", strings.Join(missing, ", "))
+		}
+	}
 }
 
-func createComponent(ctx context.Context, client *storyblok.Client, spaceID int, component storyblok.Component, presets []storyblok.ComponentPreset, created *[]string, targetByName map[string]storyblok.Component) error {
+func createComponent(ctx context.Context, client *storyblok.Client, spaceID int, component storyblok.Component, presets []storyblok.ComponentPreset) (storyblok.Component, error) {
 	defaultName := defaultPresetName(component, presets)
 	component.PresetID = 0
 	createdComponent, err := client.CreateComponent(ctx, spaceID, component)
 	if err != nil {
-		return err
+		return storyblok.Component{}, err
 	}
-	*created = append(*created, createdComponent.Name)
-	targetByName[strings.ToLower(createdComponent.Name)] = createdComponent
 
 	if len(presets) == 0 {
-		return nil
+		return createdComponent, nil
 	}
 
 	createdPresets := make([]storyblok.ComponentPreset, 0, len(presets))
@@ -499,7 +791,7 @@ func createComponent(ctx context.Context, client *storyblok.Client, spaceID int,
 		preset.ID = 0
 		newPreset, err := client.CreatePreset(ctx, spaceID, preset)
 		if err != nil {
-			return err
+			return storyblok.Component{}, err
 		}
 		createdPresets = append(createdPresets, newPreset)
 	}
@@ -507,13 +799,15 @@ func createComponent(ctx context.Context, client *storyblok.Client, spaceID int,
 	if defaultName != "" {
 		if targetPreset, ok := findPresetByName(createdPresets, defaultName); ok {
 			createdComponent.PresetID = targetPreset.ID
-			if _, err := client.UpdateComponent(ctx, spaceID, createdComponent.ID, createdComponent); err != nil {
-				return err
+			if updatedComponent, err := client.UpdateComponent(ctx, spaceID, createdComponent.ID, createdComponent); err != nil {
+				return storyblok.Component{}, err
+			} else {
+				createdComponent = updatedComponent
 			}
 		}
 	}
 
-	return nil
+	return createdComponent, nil
 }
 
 func defaultPresetName(component storyblok.Component, presets []storyblok.ComponentPreset) string {
@@ -539,13 +833,14 @@ func findPresetByName(presets []storyblok.ComponentPreset, name string) (storybl
 	return storyblok.ComponentPreset{}, false
 }
 
-func updateComponent(ctx context.Context, client *storyblok.Client, spaceID int, existing storyblok.Component, updated storyblok.Component, presets []storyblok.ComponentPreset, targetPresets []storyblok.ComponentPreset) error {
+func updateComponent(ctx context.Context, client *storyblok.Client, spaceID int, existing storyblok.Component, updated storyblok.Component, presets []storyblok.ComponentPreset, targetPresets []storyblok.ComponentPreset) (storyblok.Component, error) {
 	defaultName := defaultPresetName(updated, presets)
 	updated.ID = existing.ID
 	updated.PresetID = 0
 
-	if _, err := client.UpdateComponent(ctx, spaceID, existing.ID, updated); err != nil {
-		return err
+	resultComponent, err := client.UpdateComponent(ctx, spaceID, existing.ID, updated)
+	if err != nil {
+		return storyblok.Component{}, err
 	}
 
 	existingPresets := map[string]storyblok.ComponentPreset{}
@@ -562,14 +857,14 @@ func updateComponent(ctx context.Context, client *storyblok.Client, spaceID int,
 			preset.ID = existingPreset.ID
 			updatedPreset, err := client.UpdatePreset(ctx, spaceID, preset)
 			if err != nil {
-				return err
+				return storyblok.Component{}, err
 			}
 			existingPresets[key] = updatedPreset
 		} else {
 			preset.ID = 0
 			createdPreset, err := client.CreatePreset(ctx, spaceID, preset)
 			if err != nil {
-				return err
+				return storyblok.Component{}, err
 			}
 			existingPresets[key] = createdPreset
 		}
@@ -579,23 +874,26 @@ func updateComponent(ctx context.Context, client *storyblok.Client, spaceID int,
 		if targetPreset, ok := existingPresets[defaultName]; ok {
 			if targetPreset.ID != existing.PresetID {
 				updated.PresetID = targetPreset.ID
-				if _, err := client.UpdateComponent(ctx, spaceID, existing.ID, updated); err != nil {
-					return err
+				if refreshed, err := client.UpdateComponent(ctx, spaceID, existing.ID, updated); err != nil {
+					return storyblok.Component{}, err
+				} else {
+					resultComponent = refreshed
 				}
 			}
 		}
 	}
 
-	return nil
+	return resultComponent, nil
 }
 
 func printPushSummary(result Result, opts Options) {
 	if opts.DryRun {
 		fmt.Println()
-		fmt.Printf("Dry run summary: %d components, %d presets (rate-limit retries: %d)\n",
+		fmt.Printf("Dry run summary: %d components, %d presets (rate-limit retries: %d, server retries: %d)\n",
 			result.ComponentsSynced,
 			result.PresetsSynced,
 			result.RateLimitRetries,
+			result.ServerErrorRetries,
 		)
 		if len(result.MissingSelectors) > 0 {
 			fmt.Fprintf(os.Stderr, "Missing components matching: %s\n", strings.Join(result.MissingSelectors, ", "))
@@ -604,12 +902,13 @@ func printPushSummary(result Result, opts Options) {
 	}
 
 	fmt.Println()
-	fmt.Printf("Pushed %d components and %d presets to space %d in %s (rate-limit retries: %d)\n",
+	fmt.Printf("Pushed %d components and %d presets to space %d in %s (rate-limit retries: %d, server retries: %d)\n",
 		result.ComponentsSynced,
 		result.PresetsSynced,
 		opts.SpaceID,
 		result.Duration.Truncate(time.Millisecond),
 		result.RateLimitRetries,
+		result.ServerErrorRetries,
 	)
 	if len(result.CreatedComponents) > 0 {
 		fmt.Printf("  Created: %s\n", strings.Join(result.CreatedComponents, ", "))
@@ -620,4 +919,17 @@ func printPushSummary(result Result, opts Options) {
 	if len(result.MissingSelectors) > 0 {
 		fmt.Fprintf(os.Stderr, "Missing components matching: %s\n", strings.Join(result.MissingSelectors, ", "))
 	}
+}
+
+func summarizeList(items []string, limit int) string {
+	if len(items) == 0 {
+		return ""
+	}
+	if limit <= 0 {
+		limit = 3
+	}
+	if len(items) <= limit {
+		return strings.Join(items, ", ")
+	}
+	return fmt.Sprintf("%s (+%d more)", strings.Join(items[:limit], ", "), len(items)-limit)
 }

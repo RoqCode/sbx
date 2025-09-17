@@ -70,6 +70,12 @@ func init() {
 	rootCmd.PersistentFlags().IntVar(&globalOpts.TargetSpaceID, "target-space", defaultTarget, "Target space ID (env: TARGET_SPACE_ID)")
 	rootCmd.PersistentFlags().StringVar(&globalOpts.OutDir, "out", defaultOut, "Output directory for component schemas (env: SBX_OUT_DIR)")
 
+	if defaultToken != "" {
+		if tokenFlag := rootCmd.PersistentFlags().Lookup("token"); tokenFlag != nil {
+			tokenFlag.DefValue = maskSecret(defaultToken)
+		}
+	}
+
 	// Inject subcommands
 	rootCmd.AddCommand(newPullCommand())
 	rootCmd.AddCommand(newPushCommand())
@@ -100,6 +106,18 @@ func defaultString(value string, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+func maskSecret(secret string) string {
+	secret = strings.TrimSpace(secret)
+	if secret == "" {
+		return ""
+	}
+	if len(secret) <= 4 {
+		return strings.Repeat("*", len(secret))
+	}
+	masked := strings.Repeat("*", len(secret)-4)
+	return masked + secret[len(secret)-4:]
 }
 
 // Global returns a snapshot of global options for consumers.
