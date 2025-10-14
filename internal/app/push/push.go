@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/singleflight"
 
 	"sbx/internal/fsutil"
 	"sbx/internal/infra/limiter"
@@ -56,8 +57,9 @@ var (
 )
 
 type groupCache struct {
-	mu   sync.RWMutex
-	data map[string]string
+	mu     sync.RWMutex
+	data   map[string]string
+	single singleflight.Group
 }
 
 func newGroupCache() *groupCache {
@@ -88,8 +90,9 @@ func (c *groupCache) Has(name string) bool {
 }
 
 type tagCache struct {
-	mu   sync.RWMutex
-	data map[string]int
+	mu     sync.RWMutex
+	data   map[string]int
+	single singleflight.Group
 }
 
 func newTagCache() *tagCache {
@@ -100,14 +103,22 @@ func (c *tagCache) Set(name string, id int) {
 	if name == "" || id <= 0 {
 		return
 	}
+	key := strings.TrimSpace(name)
+	if key == "" {
+		return
+	}
 	c.mu.Lock()
-	c.data[name] = id
+	c.data[key] = id
 	c.mu.Unlock()
 }
 
 func (c *tagCache) Get(name string) (int, bool) {
+	key := strings.TrimSpace(name)
+	if key == "" {
+		return 0, false
+	}
 	c.mu.RLock()
-	id, ok := c.data[name]
+	id, ok := c.data[key]
 	c.mu.RUnlock()
 	return id, ok
 }
@@ -153,6 +164,19 @@ type componentOutcome struct {
 	updated     bool
 }
 
+func logSyncOutcome(outcome componentOutcome) {
+	if outcome.name == "" {
+		return
+	}
+	if outcome.created {
+		successf("Created component %s (id=%d)", outcome.name, outcome.componentID)
+		return
+	}
+	if outcome.updated {
+		successf("Updated component %s (id=%d)", outcome.name, outcome.componentID)
+	}
+}
+
 type componentProcessor struct {
 	client        *storyblok.Client
 	spaceID       int
@@ -164,6 +188,8 @@ type componentProcessor struct {
 
 func (p *componentProcessor) Process(ctx context.Context, plan componentPlan) (componentOutcome, error) {
 	component := plan.component
+	infof("Syncing component %s", component.Name)
+	infof("Component %s has %d preset candidates", component.Name, len(plan.presets))
 	if plan.component.ComponentGroupName != "" {
 		uuid, err := ensureComponentGroup(ctx, p.client, p.spaceID, p.groups, plan.component.ComponentGroupName)
 		if err != nil {
@@ -370,13 +396,11 @@ func Run(ctx context.Context, opts Options) (Result, error) {
 	var plans []componentPlan
 	plans = make([]componentPlan, 0, len(selectedComponents))
 
-	for i, plan := range selectedComponents {
+	for _, plan := range selectedComponents {
 		component := plan.Component
-		infof("[%d/%d] syncing component %s", i+1, len(selectedComponents), component.Name)
 
 		existing, exists := componentCache.Get(component.Name)
 		componentPresets := presetsForComponent(component, presetMap)
-		infof("Component %s has %d preset candidates", component.Name, len(componentPresets))
 
 		if opts.DryRun {
 			logDryRun(component, exists, opts.SpaceID, len(componentPresets), groupCache.Has, tagCache.Has)
@@ -437,6 +461,7 @@ func Run(ctx context.Context, opts Options) (Result, error) {
 						outcomeMu.Lock()
 						outcomes[job.index] = outcome
 						outcomeMu.Unlock()
+						logSyncOutcome(outcome)
 					}
 				}
 			})
@@ -463,10 +488,8 @@ func Run(ctx context.Context, opts Options) (Result, error) {
 				continue
 			}
 			if outcome.created {
-				successf("Created component %s (id=%d)", outcome.name, outcome.componentID)
 				created = append(created, outcome.name)
 			} else if outcome.updated {
-				successf("Updated component %s (id=%d)", outcome.name, outcome.componentID)
 				updated = append(updated, outcome.name)
 			}
 			result.ComponentsSynced++
@@ -665,28 +688,29 @@ func ensureComponentGroup(ctx context.Context, client *storyblok.Client, spaceID
 	}
 
 	key := strings.ToLower(strings.TrimSpace(groupName))
-
-	groups.mu.Lock()
-	if uuid, ok := groups.data[key]; ok {
-		groups.mu.Unlock()
-		return uuid, nil
+	if key == "" {
+		return "", nil
 	}
-	groups.mu.Unlock()
 
-	created, err := client.CreateComponentGroup(ctx, spaceID, storyblok.ComponentGroup{Name: groupName})
+	value, err, _ := groups.single.Do(key, func() (any, error) {
+		if uuid, ok := groups.Lookup(groupName); ok {
+			return uuid, nil
+		}
+		created, err := client.CreateComponentGroup(ctx, spaceID, storyblok.ComponentGroup{Name: groupName})
+		if err != nil {
+			return "", err
+		}
+		groups.Set(groupName, created.UUID)
+		return created.UUID, nil
+	})
 	if err != nil {
 		return "", err
 	}
-
-	groups.mu.Lock()
-	if uuid, ok := groups.data[key]; ok {
-		groups.mu.Unlock()
-		return uuid, nil
+	uuid, ok := value.(string)
+	if !ok {
+		return "", fmt.Errorf("unexpected component group result type %T", value)
 	}
-	groups.data[key] = created.UUID
-	groups.mu.Unlock()
-
-	return created.UUID, nil
+	return uuid, nil
 }
 
 func mapSchemaGroupWhitelist(component *storyblok.Component, lookup func(string) (string, bool)) error {
@@ -733,12 +757,25 @@ func ensureInternalTags(ctx context.Context, client *storyblok.Client, spaceID i
 			ids = append(ids, id)
 			continue
 		}
-		created, err := client.CreateInternalTag(ctx, spaceID, storyblok.InternalTag{Name: name, ObjectType: "component"})
+		value, err, _ := tags.single.Do(name, func() (any, error) {
+			if id, ok := tags.Get(name); ok {
+				return id, nil
+			}
+			created, err := client.CreateInternalTag(ctx, spaceID, storyblok.InternalTag{Name: name, ObjectType: "component"})
+			if err != nil {
+				return 0, err
+			}
+			tags.Set(name, created.ID)
+			return created.ID, nil
+		})
 		if err != nil {
 			return nil, err
 		}
-		tags.Set(name, created.ID)
-		ids = append(ids, created.ID)
+		id, ok := value.(int)
+		if !ok {
+			return nil, fmt.Errorf("unexpected internal tag result type %T", value)
+		}
+		ids = append(ids, id)
 	}
 	return ids, nil
 }
